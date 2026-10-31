@@ -339,12 +339,21 @@ HTML_TEMPLATE = """
                 <!-- Mass Form -->
                 <form id="massForm" class="space-y-4 hidden">
                     <div>
-                        <label class="block text-sm font-medium text-slate-400 mb-1">Cards List (One per line)</label>
+                        <div class="flex justify-between items-center mb-1">
+                            <label class="text-sm font-medium text-slate-400">Cards List (One per line)</label>
+                            <div class="space-x-2">
+                                <button type="button" onclick="formatCards()" class="text-xs bg-emerald-900/60 hover:bg-emerald-800 text-emerald-300 px-2 py-0.5 rounded border border-emerald-700">Auto-Format</button>
+                                <button type="button" onclick="clearCards()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded">Clear</button>
+                            </div>
+                        </div>
                         <textarea id="massCards" rows="6" placeholder="4111222233334444|08|2028|123&#10;5455122802892688|10|2029|045" required
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
                     </div>
                     <div>
-                        <label class="block text-sm font-medium text-slate-400 mb-1">Proxies List (One per line, optional)</label>
+                        <div class="flex justify-between items-center mb-1">
+                            <label class="text-sm font-medium text-slate-400">Proxies List (One per line, optional)</label>
+                            <button type="button" onclick="clearProxies()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded">Clear</button>
+                        </div>
                         <textarea id="massProxies" rows="3" placeholder="http://ip:port&#10;http://user:pass@ip:port"
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
                     </div>
@@ -365,7 +374,7 @@ HTML_TEMPLATE = """
                 <div>
                     <div class="flex justify-between items-center mb-3">
                         <h2 class="text-lg font-semibold text-slate-300">Live Result Output</h2>
-                        <button onclick="clearLogs()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded">Clear</button>
+                        <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
                         <span>[*] Ready for requests...</span>
@@ -398,8 +407,37 @@ HTML_TEMPLATE = """
             }
         }
 
-        function clearLogs() {
+        function clearCards() {
+            document.getElementById('massCards').value = '';
+        }
+
+        function clearProxies() {
+            document.getElementById('massProxies').value = '';
+        }
+
+        function clearAllLogs() {
             document.getElementById('resultBox').innerHTML = '<span>[*] Cleared output log.</span>';
+        }
+
+        function formatCards() {
+            const textarea = document.getElementById('massCards');
+            const lines = textarea.value.split('\\n');
+            let formatted = [];
+
+            for (let line of lines) {
+                let clean = line.trim();
+                if (!clean || clean.startsWith('#')) continue;
+                // Split by common delimiters (| : / \\ space)
+                let parts = clean.split(/[|:/\\s]+/);
+                if (parts.length >= 4) {
+                    let cc = parts[0];
+                    let mm = parts[1].padStart(2, '0');
+                    let yy = parts[2];
+                    let cvv = parts[3];
+                    formatted.push(`${cc}|${mm}|${yy}|${cvv}`);
+                }
+            }
+            textarea.value = formatted.join('\\n');
         }
 
         const resultBox = document.getElementById('resultBox');
@@ -536,7 +574,6 @@ async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threa
             checker = WooCommerceChecker(proxies=parsed_proxies, max_concurrency=threads)
             tasks = [checker.check_card(c) for c in parsed_cards]
 
-            # Stream results one by one in real-time as each card finishes
             for coro in asyncio.as_completed(tasks):
                 try:
                     res = await coro
