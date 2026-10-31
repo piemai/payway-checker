@@ -310,6 +310,26 @@ HTML_TEMPLATE = """
             <span class="text-xs bg-emerald-900/50 text-emerald-300 px-3 py-1 rounded-full border border-emerald-700">Online & Active</span>
         </header>
 
+        <!-- Statistics Scoreboard Bar -->
+        <div class="grid grid-cols-4 gap-4 text-center">
+            <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
+                <div class="text-xs text-slate-400">TOTAL CHECKED</div>
+                <div id="statTotal" class="text-xl font-bold text-slate-200">0</div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
+                <div class="text-xs text-emerald-400">LIVE HITS</div>
+                <div id="statLive" class="text-xl font-bold text-emerald-400">0</div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
+                <div class="text-xs text-rose-400">DECLINES (DEAD)</div>
+                <div id="statDead" class="text-xl font-bold text-rose-400">0</div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 p-3 rounded-xl shadow">
+                <div class="text-xs text-amber-400">ERRORS</div>
+                <div id="statError" class="text-xl font-bold text-amber-400">0</div>
+            </div>
+        </div>
+
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <!-- Input Form Card -->
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-4">
@@ -352,7 +372,10 @@ HTML_TEMPLATE = """
                     <div>
                         <div class="flex justify-between items-center mb-1">
                             <label class="text-sm font-medium text-slate-400">Proxies List (One per line, optional)</label>
-                            <button type="button" onclick="clearProxies()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded">Clear</button>
+                            <div class="space-x-2">
+                                <button type="button" onclick="testProxies()" class="text-xs bg-blue-900/60 hover:bg-blue-800 text-blue-300 px-2 py-0.5 rounded border border-blue-700">Test Proxies</button>
+                                <button type="button" onclick="clearProxies()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded">Clear</button>
+                            </div>
                         </div>
                         <textarea id="massProxies" rows="3" placeholder="http://ip:port&#10;http://user:pass@ip:port"
                             class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
@@ -373,21 +396,62 @@ HTML_TEMPLATE = """
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg flex flex-col justify-between">
                 <div>
                     <div class="flex justify-between items-center mb-3">
-                        <h2 class="text-lg font-semibold text-slate-300">Live Result Output</h2>
+                        <div class="space-x-2">
+                            <button onclick="exportHits()" class="text-xs bg-emerald-900/60 hover:bg-emerald-800 text-emerald-300 border border-emerald-700 px-2.5 py-1 rounded">Export Hits (.txt)</button>
+                            <button onclick="exportAll()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded">Export All (.txt)</button>
+                        </div>
                         <button onclick="clearAllLogs()" class="text-xs bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800 px-2.5 py-1 rounded">Clear All</button>
                     </div>
                     <div id="resultBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs space-y-2 text-slate-400">
                         <span>[*] Ready for requests...</span>
                     </div>
                 </div>
-                <div class="text-right text-xs text-slate-500 pt-3 border-t border-slate-800">
-                    Engine: Asyncio + Streaming SSE (Real-Time)
+                <div class="flex justify-between items-center text-xs text-slate-500 pt-3 border-t border-slate-800">
+                    <span>Engine: Asyncio + Streaming SSE</span>
+                    <label class="flex items-center space-x-1 cursor-pointer select-none">
+                        <input type="checkbox" id="soundToggle" checked class="rounded bg-slate-950 border-slate-700">
+                        <span>Audio Alert on Hit</span>
+                    </label>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- Audio Synth for Hit Notification -->
     <script>
+        let stats = { total: 0, live: 0, dead: 0, error: 0 };
+        let allResultsHistory = [];
+
+        function playHitSound() {
+            if (!document.getElementById('soundToggle').checked) return;
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+                osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1); // A5
+                gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.4);
+            } catch (e) {}
+        }
+
+        function updateStats(status) {
+            stats.total++;
+            if (status === 'LIVE') stats.live++;
+            else if (status === 'DEAD') stats.dead++;
+            else stats.error++;
+
+            document.getElementById('statTotal').textContent = stats.total;
+            document.getElementById('statLive').textContent = stats.live;
+            document.getElementById('statDead').textContent = stats.dead;
+            document.getElementById('statError').textContent = stats.error;
+        }
+
         function switchTab(mode) {
             const singleForm = document.getElementById('singleForm');
             const massForm = document.getElementById('massForm');
@@ -407,37 +471,82 @@ HTML_TEMPLATE = """
             }
         }
 
-        function clearCards() {
-            document.getElementById('massCards').value = '';
-        }
-
-        function clearProxies() {
-            document.getElementById('massProxies').value = '';
-        }
-
+        function clearCards() { document.getElementById('massCards').value = ''; }
+        function clearProxies() { document.getElementById('massProxies').value = ''; }
+        
         function clearAllLogs() {
             document.getElementById('resultBox').innerHTML = '<span>[*] Cleared output log.</span>';
+            stats = { total: 0, live: 0, dead: 0, error: 0 };
+            allResultsHistory = [];
+            document.getElementById('statTotal').textContent = '0';
+            document.getElementById('statLive').textContent = '0';
+            document.getElementById('statDead').textContent = '0';
+            document.getElementById('statError').textContent = '0';
         }
 
         function formatCards() {
             const textarea = document.getElementById('massCards');
             const lines = textarea.value.split('\\n');
             let formatted = [];
-
             for (let line of lines) {
                 let clean = line.trim();
                 if (!clean || clean.startsWith('#')) continue;
-                // Split by common delimiters (| : / \\ space)
                 let parts = clean.split(/[|:/\\s]+/);
                 if (parts.length >= 4) {
-                    let cc = parts[0];
-                    let mm = parts[1].padStart(2, '0');
-                    let yy = parts[2];
-                    let cvv = parts[3];
-                    formatted.push(`${cc}|${mm}|${yy}|${cvv}`);
+                    formatted.push(`${parts[0]}|${parts[1].padStart(2, '0')}|${parts[2]}|${parts[3]}`);
                 }
             }
             textarea.value = formatted.join('\\n');
+        }
+
+        async function testProxies() {
+            const proxies = document.getElementById('massProxies').value;
+            if (!proxies.trim()) {
+                alert('Please enter at least one proxy to test.');
+                return;
+            }
+            const resultBox = document.getElementById('resultBox');
+            resultBox.innerHTML += `<div class="text-blue-400">[*] Testing proxy health...</div>`;
+            
+            try {
+                const response = await fetch('/api/test-proxies', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: `proxies=${encodeURIComponent(proxies)}`
+                });
+                const resList = await response.json();
+                resList.forEach(p => {
+                    let col = p.status === 'OK' ? 'text-emerald-400' : 'text-rose-400';
+                    resultBox.innerHTML += `<div class="${col}">[PROXY ${p.status}] ${p.proxy} (${p.latency_ms}ms)</div>`;
+                });
+            } catch (e) {
+                resultBox.innerHTML += `<div class="text-rose-500">[ERROR] Proxy test failed: ${e.message}</div>`;
+            }
+            resultBox.scrollTop = resultBox.scrollHeight;
+        }
+
+        function exportHits() {
+            const hits = allResultsHistory.filter(r => r.status === 'LIVE').map(r => `${r.card} -> ${r.reason}`).join('\\n');
+            if (!hits) { alert('No live hits to export!'); return; }
+            downloadFile(hits, 'live_hits.txt');
+        }
+
+        function exportAll() {
+            const all = allResultsHistory.map(r => `[${r.status}] ${r.card} -> ${r.reason}`).join('\\n');
+            if (!all) { alert('No results to export!'); return; }
+            downloadFile(all, 'all_results_audit.txt');
+        }
+
+        function downloadFile(content, filename) {
+            const blob = new Blob([content], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
         }
 
         const resultBox = document.getElementById('resultBox');
@@ -460,7 +569,6 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body: `card=${encodeURIComponent(card)}&proxy=${encodeURIComponent(proxy)}`
                 });
-                
                 if (!response.ok) throw new Error(`Server error: ${response.status}`);
                 const data = await response.json();
                 appendResult(data);
@@ -505,7 +613,7 @@ HTML_TEMPLATE = """
                     buffer += decoder.decode(value, { stream: true });
                     
                     const lines = buffer.split('\\n\\n');
-                    buffer = lines.pop(); // keep incomplete chunk
+                    buffer = lines.pop();
                     
                     for (const line of lines) {
                         if (line.startsWith('data: ')) {
@@ -527,12 +635,20 @@ HTML_TEMPLATE = """
         });
 
         function appendResult(data) {
+            allResultsHistory.push(data);
+            updateStats(data.status);
+
             let color = 'text-slate-300';
             const latency = (data.latency_ms !== undefined && !isNaN(data.latency_ms)) ? data.latency_ms.toFixed(0) : '0';
             
-            if (data.status === 'LIVE') color = 'text-emerald-400 font-bold';
-            else if (data.status === 'DEAD') color = 'text-rose-400';
-            else if (data.status === 'ERROR') color = 'text-amber-400';
+            if (data.status === 'LIVE') {
+                color = 'text-emerald-400 font-bold';
+                playHitSound();
+            } else if (data.status === 'DEAD') {
+                color = 'text-rose-400';
+            } else if (data.status === 'ERROR') {
+                color = 'text-amber-400';
+            }
 
             resultBox.innerHTML += `<div class="${color}">[${data.status}] ${data.card} -> ${data.reason} (${latency}ms)</div>`;
             resultBox.scrollTop = resultBox.scrollHeight;
@@ -559,6 +675,27 @@ async def api_check(card: str = Form(...), proxy: str = Form("")) -> dict[str, A
         return {"card": res.card.raw, "status": res.status, "reason": res.reason, "latency_ms": res.latency_ms}
     except Exception as e:
         return {"card": card, "status": "ERROR", "reason": f"Server Exception: {str(e)}", "latency_ms": 0}
+
+@app.post("/api/test-proxies")
+async def api_test_proxies(proxies: str = Form(...)) -> list[dict[str, Any]]:
+    proxy_lines = [p.strip() for p in proxies.splitlines() if p.strip() and not p.strip().startswith("#")]
+    results = []
+
+    async def test_single(proxy: str):
+        t0 = time.perf_counter()
+        try:
+            async with AsyncSession(impersonate="chrome120", proxy=proxy, verify=True) as s:
+                resp = await s.get("https://httpbin.org/ip", timeout=5)
+                lat = (time.perf_counter() - t0) * 1000.0
+                if resp.status_code == 200:
+                    return {"proxy": proxy, "status": "OK", "latency_ms": int(lat)}
+        except Exception:
+            pass
+        return {"proxy": proxy, "status": "DEAD", "latency_ms": 0}
+
+    tasks = [test_single(p) for p in proxy_lines]
+    out = await asyncio.gather(*tasks)
+    return list(out)
 
 @app.post("/api/mass-stream")
 async def api_mass_stream(cards: str = Form(...), proxies: str = Form(""), threads: int = Form(8)):
